@@ -64,12 +64,56 @@ namespace lsp
         #define CLR_HANDLE(hThread) hThread     = 0;
     #endif
 
+    #if !defined(PLATFORM_WINDOWS)
+        static void add_millis(struct timespec *ts, wsize_t millis)
+        {
+            const time_t max_sec = time_t((~uint64_t(0)) >> (65 - sizeof(time_t) * 8)); // Maximum value of time_t
+            const uint64_t sec  = millis / 1000;
+            ts->tv_nsec        += (millis % 1000) * 1000000;
+            ts->tv_sec         += ts->tv_nsec / 1000000000;
+            ts->tv_nsec        %= 1000000000;
+
+            // Wait until cancelled if the deadline does not fit into time_t
+            if (sec > uint64_t(max_sec - ts->tv_sec))
+            {
+                ts->tv_sec          = max_sec;
+                ts->tv_nsec         = 999999999;
+            }
+            else
+                ts->tv_sec         += sec;
+        }
+    #endif /* PLATFORM_WINDOWS */
+
+    #if defined(PLATFORM_MACOSX)
+        // Convert the current time to the time left until the deadline, false if it has been reached
+        static bool time_left(struct timespec *left, const struct timespec *deadline)
+        {
+            if ((left->tv_sec > deadline->tv_sec) ||
+                ((left->tv_sec == deadline->tv_sec) && (left->tv_nsec >= deadline->tv_nsec)))
+                return false;
+
+            left->tv_sec        = deadline->tv_sec - left->tv_sec;
+            left->tv_nsec       = deadline->tv_nsec - left->tv_nsec;
+            if (left->tv_nsec < 0)
+            {
+                left->tv_nsec      += 1000000000;
+                --left->tv_sec;
+            }
+
+            // Limit the relative wait to one day, the deadline is checked again after it
+            if (left->tv_sec >= 86400)
+                left->tv_sec        = 86400;
+            return true;
+        }
+    #endif /* PLATFORM_MACOSX */
+
         Thread::Thread()
         {
             atomic_store(&enState, TS_CREATED);
             nResult             = STATUS_OK;
             bCancelled          = false;
             CLR_HANDLE(hThread);
+            init_sync();
             sBinding.proc       = NULL;
             sBinding.arg        = NULL;
             sBinding.runnable   = NULL;
@@ -81,6 +125,7 @@ namespace lsp
             nResult             = STATUS_OK;
             bCancelled          = false;
             CLR_HANDLE(hThread);
+            init_sync();
             sBinding.proc       = proc;
             sBinding.arg        = NULL;
             sBinding.runnable   = NULL;
@@ -92,6 +137,7 @@ namespace lsp
             nResult             = STATUS_OK;
             bCancelled          = false;
             CLR_HANDLE(hThread);
+            init_sync();
             sBinding.proc       = proc;
             sBinding.runnable   = NULL;
             sBinding.arg        = arg;
@@ -103,6 +149,7 @@ namespace lsp
             nResult             = STATUS_OK;
             bCancelled          = false;
             CLR_HANDLE(hThread);
+            init_sync();
             sBinding.proc       = NULL;
             sBinding.arg        = NULL;
             sBinding.runnable   = runnable;
@@ -113,9 +160,35 @@ namespace lsp
     #if defined(PLATFORM_WINDOWS)
             if (hThread != INVALID_HANDLE_VALUE)
                 CloseHandle(hThread);
+            DeleteCriticalSection(&sLock);
+    #else
+            pthread_cond_destroy(&sCancel);
+            pthread_mutex_destroy(&sLock);
     #endif /* PLATFORM_WINDOWS */
 
             CLR_HANDLE(hThread);
+        }
+
+        void Thread::init_sync()
+        {
+    #if defined(PLATFORM_WINDOWS)
+            InitializeCriticalSection(&sLock);
+            InitializeConditionVariable(&sCancel);
+    #else
+            pthread_mutex_init(&sLock, NULL);
+
+            // Use CLOCK_MONOTONIC for sleep() if possible, CLOCK_REALTIME otherwise. MacOS has no
+            // pthread_condattr_setclock() and waits for the time left until CLOCK_MONOTONIC deadline.
+            pthread_condattr_t attr;
+            pthread_condattr_init(&attr);
+            nClockId            = CLOCK_MONOTONIC;
+        #if !defined(PLATFORM_MACOSX)
+            if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) != 0)
+                nClockId            = CLOCK_REALTIME;
+        #endif /* PLATFORM_MACOSX */
+            pthread_cond_init(&sCancel, &attr);
+            pthread_condattr_destroy(&attr);
+    #endif /* PLATFORM_WINDOWS */
         }
 
         status_t Thread::run()
@@ -138,7 +211,19 @@ namespace lsp
                     return STATUS_BAD_STATE;
             }
 
+            // Set the flag and wake up the thread if it sleeps
+    #if defined(PLATFORM_WINDOWS)
+            EnterCriticalSection(&sLock);
             bCancelled  = true;
+            WakeConditionVariable(&sCancel);
+            LeaveCriticalSection(&sLock);
+    #else
+            pthread_mutex_lock(&sLock);
+            bCancelled  = true;
+            pthread_cond_signal(&sCancel);
+            pthread_mutex_unlock(&sLock);
+    #endif /* PLATFORM_WINDOWS */
+
             return STATUS_OK;
         }
     
@@ -216,15 +301,35 @@ namespace lsp
                 if (pThis->bCancelled)
                     return STATUS_CANCELLED;
 
-                while (millis > 0)
-                {
-                    if (pThis->bCancelled)
-                        return STATUS_CANCELLED;
+                // Wait until the timeout expires or the thread is cancelled
+                Thread *self        = pThis;
+                status_t res        = STATUS_OK;
+                wsize_t left        = millis;
+                LARGE_INTEGER freq, start, now;
+                QueryPerformanceFrequency(&freq);
+                QueryPerformanceCounter(&start);
 
-                    DWORD interval  = (millis > 100) ? 100 : millis;
-                    Sleep(interval);
-                    millis         -= interval;
+                EnterCriticalSection(&self->sLock);
+                while ((!self->bCancelled) && (left > 0))
+                {
+                    const DWORD timeout = (left >= INFINITE) ? INFINITE - 1 : DWORD(left);
+                    if ((!SleepConditionVariableCS(&self->sCancel, &self->sLock, timeout)) &&
+                        (GetLastError() != ERROR_TIMEOUT))
+                    {
+                        res                 = STATUS_UNKNOWN_ERR;
+                        break;
+                    }
+
+                    // Compute the time left, the timeout may expire early and wake-ups may be spurious
+                    QueryPerformanceCounter(&now);
+                    const wsize_t passed = wsize_t(now.QuadPart - start.QuadPart) * 1000 / wsize_t(freq.QuadPart);
+                    left                = (passed < millis) ? millis - passed : 0;
                 }
+                if (self->bCancelled)
+                    res                 = STATUS_CANCELLED;
+                LeaveCriticalSection(&self->sLock);
+
+                return res;
             }
 
             return STATUS_OK;
@@ -314,28 +419,50 @@ namespace lsp
                 if (pThis->bCancelled)
                     return STATUS_CANCELLED;
 
-                while (millis > 0)
+                // Compute the deadline
+                Thread *self        = pThis;
+                status_t res        = STATUS_OK;
+                struct timespec deadline;
+
+                if (::clock_gettime(self->nClockId, &deadline) != 0)
+                    return STATUS_UNKNOWN_ERR;
+                add_millis(&deadline, millis);
+
+                // Wait until the deadline is reached or the thread is cancelled
+                pthread_mutex_lock(&self->sLock);
+                while (!self->bCancelled)
                 {
-                    if (pThis->bCancelled)
-                        return STATUS_CANCELLED;
-
-                    wsize_t interval  = (millis > 100) ? 100 : millis;
-                    req.tv_sec  = 0;
-                    req.tv_nsec = interval * 1000000;
-
-                    while (::nanosleep(&req, &rem) != 0)
+        #if defined(PLATFORM_MACOSX)
+                    struct timespec left;
+                    if (::clock_gettime(CLOCK_MONOTONIC, &left) != 0)
                     {
-                        int code = errno;
-                        if (code != EINTR)
-                            return STATUS_UNKNOWN_ERR;
-
-                        if (pThis->bCancelled)
-                            return STATUS_CANCELLED;
-                        req = rem;
+                        res                 = STATUS_UNKNOWN_ERR;
+                        break;
                     }
-
-                    millis     -= interval;
+                    if (!time_left(&left, &deadline))
+                        break;
+                    const int code      = pthread_cond_timedwait_relative_np(&self->sCancel, &self->sLock, &left);
+                    if ((code != 0) && (code != ETIMEDOUT))
+                    {
+                        res                 = STATUS_UNKNOWN_ERR;
+                        break;
+                    }
+        #else
+                    const int code      = pthread_cond_timedwait(&self->sCancel, &self->sLock, &deadline);
+                    if (code == ETIMEDOUT)
+                        break;
+                    else if (code != 0)
+                    {
+                        res                 = STATUS_UNKNOWN_ERR;
+                        break;
+                    }
+        #endif /* PLATFORM_MACOSX */
                 }
+                if (self->bCancelled)
+                    res                 = STATUS_CANCELLED;
+                pthread_mutex_unlock(&self->sLock);
+
+                return res;
             }
 
             return STATUS_OK;

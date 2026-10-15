@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2025 Linux Studio Plugins Project <https://lsp-plug.in/>
- *           (C) 2025 Vladimir Sadovnikov <sadko4u@gmail.com>
+ * Copyright (C) 2026 Linux Studio Plugins Project <https://lsp-plug.in/>
+ *           (C) 2026 Vladimir Sadovnikov <sadko4u@gmail.com>
  *
  * This file is part of lsp-runtime-lib
  * Created on: 25 февр. 2019 г.
@@ -29,6 +29,7 @@
 
 #if defined(PLATFORM_WINDOWS)
     #include <processthreadsapi.h>
+    #include <synchapi.h>
 #else
     #include <pthread.h>
 #endif /* PLATFORM_WINDOWS */
@@ -83,8 +84,13 @@ namespace lsp
 
 #if defined(PLATFORM_WINDOWS)
                 HANDLE                      hThread;        // Windows threads
+                CRITICAL_SECTION            sLock;          // Lock for cancellation wake-up
+                CONDITION_VARIABLE          sCancel;        // Cancellation wake-up for sleep()
 #else
                 pthread_t                   hThread;        // POSIX threads
+                pthread_mutex_t             sLock;          // Lock for cancellation wake-up
+                pthread_cond_t              sCancel;        // Cancellation wake-up for sleep()
+                clockid_t                   nClockId;       // Clock used by sleep()
 #endif  /* PLATFORM_WINDOWS */
 
             protected:
@@ -97,7 +103,10 @@ namespace lsp
                 static void *thread_launcher(void *arg);
 #endif /* PLATFORM_WINDOWS */
 
+                Thread(const Thread &src);                  // Deny copying
                 Thread & operator = (const Thread &src);    // Deny copying
+
+                void                        init_sync();
 
             public:
                 explicit Thread();
@@ -105,7 +114,7 @@ namespace lsp
                 explicit Thread(thread_proc_t proc, void *arg);
                 explicit Thread(IRunnable *runnable);
 
-                virtual ~Thread();
+                virtual ~Thread();                          // The thread must be joined before it is destroyed
 
             public:
                 /**
